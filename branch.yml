@@ -1,0 +1,372 @@
+name: Branch Build (Trading Platform)
+
+on:
+  workflow_dispatch:
+
+
+concurrency:
+  group: ${{ github.ref }}
+
+permissions:
+  id-token: write
+  packages: write
+  contents: write
+
+jobs:
+  trim-name:
+    name: 🔤 Trim branch name
+    runs-on: ubuntu-latest
+    outputs:
+      short_branch: ${{ steps.trim.outputs.short_branch }}
+    steps:
+      - name: 🧮 Process branch name
+        id: trim
+        run: |
+          string="${GITHUB_REF_NAME}"
+          # Replace slashes with dashes and lowercase
+          safe_branch=$(echo "$string" | tr '/' '-' | tr '[:upper:]' '[:lower:]')
+          # Take first 15 characters
+          first_15="${safe_branch:0:15}"
+          echo "Short branch: $first_15"
+          echo "short_branch=$first_15" >> $GITHUB_OUTPUT
+
+  build-and-deploy:
+    name: 🚀 Build & Publish Containers
+    needs: trim-name
+    uses: IngotTech/reusable-workflows/.github/workflows/trading-platform-build-branch.yml@trading-platform
+    with:
+      AWS_REGION: "eu-central-1"
+      ECR_REGISTRY: "987879449406.dkr.ecr.eu-central-1.amazonaws.com"
+      HELM_CHARTS_BRANCH_NAME: "develop"
+      ENVIRONMENT: "rnd-branch"
+      SERVICE_NAME: "InternalQuoteProcessor.Backend"
+      BRANCH: ${{ github.ref_name }}
+      BRANCHTRIMMED: ${{ needs.trim-name.outputs.short_branch }}
+    secrets:
+      ECR_IAM_ROLE_ARN: ${{ secrets.RND_ECR_IAM_ROLE }}
+      NUGET_USER: ${{ secrets.INGOT_GITBOT_USER }}
+      NUGET_PAT: ${{ secrets.INGOT_GITBOT_TOKEN }}
+      INGOT_GITBOT_TOKEN: ${{ secrets.INGOT_GITBOT_TOKEN }}
+---
+# ------------------------------
+# 🏗️ Build stage
+# ------------------------------
+FROM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS build-env
+
+ARG TARGETARCH
+ARG SERVICE_NAME
+ARG NUGET_FEED="https://nuget.pkg.github.com/IngotTech/index.json"
+ARG NUGET_USER
+ARG NUGET_TOKEN
+
+WORKDIR /src
+COPY . .
+
+# Configure NuGet
+RUN dotnet nuget remove source github || true && \
+    dotnet nuget add source ${NUGET_FEED} \
+      --name github \
+      --username ${NUGET_USER} \
+      --password ${NUGET_TOKEN} \
+      --store-password-in-clear-text
+
+# Build the provided service
+RUN set -e; \
+    echo "🏗️ Building service: ${SERVICE_NAME}"; \
+    if [ -f "${SERVICE_NAME}.slnx" ]; then \
+        dotnet restore "${SERVICE_NAME}.slnx"; \
+        dotnet publish "${SERVICE_NAME}.slnx" -c Release -o /app/publish -r linux-${TARGETARCH}; \
+    elif [ -f "src/${SERVICE_NAME}/${SERVICE_NAME}.csproj" ]; then \
+        dotnet restore "src/${SERVICE_NAME}/${SERVICE_NAME}.csproj"; \
+        dotnet publish "src/${SERVICE_NAME}/${SERVICE_NAME}.csproj" -c Release -o /app/publish -r linux-${TARGETARCH}; \
+    else \
+        echo "❌ Could not find ${SERVICE_NAME}.slnx or src/${SERVICE_NAME}/${SERVICE_NAME}.csproj"; \
+        exit 1; \
+    fi
+
+# ------------------------------
+# 🚀 Runtime stage
+# ------------------------------
+FROM mcr.microsoft.com/dotnet/aspnet:9.0-bookworm-slim
+
+ARG SERVICE_NAME
+ENV SERVICE_NAME=${SERVICE_NAME}
+
+WORKDIR /app
+COPY --from=build-env /app/publish .
+
+# Cleanup optional files
+RUN rm -f /app/appsettings.Development.json || true
+
+EXPOSE 8080
+ENV ASPNETCORE_URLS=http://*:8080
+
+ENTRYPOINT ["sh", "-c", "dotnet /app/${SERVICE_NAME}.dll"]
+
+---
+name: dotnet build and publish workflow
+
+on:
+  workflow_call:
+    inputs:
+      AWS_REGION:
+        required: true
+        type: string
+      ECR_REGISTRY:
+        required: true
+        type: string
+      ENVIRONMENT:
+        required: false
+        type: string
+        default: "rnd"
+      HELM_CHARTS_BRANCH_NAME:
+        required: true
+        type: string
+      SERVICE_NAME:
+        required: false
+        type: string
+        default: "" 
+      BRANCH:
+        required: true
+        type: string  
+      BRANCHTRIMMED:
+        required: true
+        type: string            
+    secrets:
+      ECR_IAM_ROLE_ARN:
+        required: true
+      NUGET_USER:
+        required: true
+      NUGET_PAT:
+        required: true
+      INGOT_GITBOT_TOKEN:
+        required: true
+
+jobs:
+  build-solution:
+    name: 🏗️ Build & Push Docker Image
+    runs-on: ubuntu-latest
+    outputs:
+      service_name: ${{ steps.normalize.outputs.repo }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.BRANCH}}
+
+      - name: Checkout reusable workflow repo
+        uses: actions/checkout@v4
+        with:
+          repository: IngotTech/reusable-workflows
+          ref: trading-platform
+          token: ${{ secrets.INGOT_GITBOT_TOKEN }}
+          path: .reusable
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ECR_IAM_ROLE_ARN }}
+          aws-region: ${{ inputs.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Normalize image name
+        id: normalize
+        run: |
+          svc_name=$(basename "$(find . -maxdepth 1 -name '*.slnx' | head -n 1)")
+          if [[ -z "$svc_name" ]]; then
+            echo "❌ No .slnx file found."
+            exit 1
+          fi
+          repo=$(echo "$svc_name" | tr '[:upper:]' '[:lower:]' | tr '.' '-' | sed -E 's/(^|-)cosmos(-|$)//g' | sed -E 's/(^|-)slnx(-|$)//g' | sed -E 's/--+/-/g' | sed -E 's/^-|-$//g')
+          echo "repo=$repo" >> $GITHUB_OUTPUT
+
+      - name: Ensure ECR repository exists
+        run: |
+          set -e
+          repo_name="${{ steps.normalize.outputs.repo }}"
+          region="${{ inputs.AWS_REGION }}"
+          echo "🔍 Checking ECR repo: $repo_name"
+          if ! aws ecr describe-repositories --repository-names "$repo_name" --region "$region" >/dev/null 2>&1; then
+            echo "⚙️  Creating ECR repository: $repo_name"
+            aws ecr create-repository \
+              --repository-name "$repo_name" \
+              --image-scanning-configuration scanOnPush=true \
+              --region "$region" >/dev/null
+          else
+            echo "✅ ECR repository already exists: $repo_name"
+          fi
+
+      - name: Build & Push Docker Image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .reusable/Dockerfiles/Dockerfile.trading-platform
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ inputs.ECR_REGISTRY }}/${{ steps.normalize.outputs.repo }}:${{ inputs.BRANCHTRIMMED }}
+            ${{ inputs.ECR_REGISTRY }}/${{ steps.normalize.outputs.repo }}:latest
+          build-args: |
+            NUGET_FEED=https://nuget.pkg.github.com/IngotTech/index.json
+            NUGET_USER=${{ secrets.NUGET_USER }}
+            NUGET_TOKEN=${{ secrets.NUGET_PAT }}
+            SERVICE_NAME=${{ inputs.SERVICE_NAME || steps.normalize.outputs.repo }}
+          cache-from: type=registry,ref=${{ inputs.ECR_REGISTRY }}/${{ steps.normalize.outputs.repo }}:buildcache
+          cache-to: type=registry,ref=${{ inputs.ECR_REGISTRY }}/${{ steps.normalize.outputs.repo }}:buildcache,mode=max
+
+
+  rollout:
+    name: 🚀 Rollout to Helm
+    needs: build-solution
+    runs-on: [self-hosted, kubernetes, rnd]
+    if: ${{ always() && needs.build-solution.result == 'success' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: IngotTech/trading-platform-helm-charts
+          token: ${{ secrets.INGOT_GITBOT_TOKEN }}
+          ref: ${{ inputs.HELM_CHARTS_BRANCH_NAME }}
+          path: trading-platform-helm-charts
+
+      - name: Update Helm values
+        run: |
+          svc="${{ needs.build-solution.outputs.service_name }}"
+          values_file="trading-platform-helm-charts/${svc}/${{ inputs.ENVIRONMENT }}/valuesqabranch.yaml"
+
+          echo "🧩 Updating Helm values for $svc"
+          if [[ ! -f "$values_file" ]]; then
+            echo "❌ Helm values file not found: $values_file"
+            exit 1
+          fi
+
+          sed -i "s/tag:.*/tag: ${{ inputs.BRANCHTRIMMED }}/" "$values_file"
+
+          cd trading-platform-helm-charts
+          git config user.email "git-bot@ingotbrokers.com"
+          git config user.name "ingot-gitbot"
+
+          # use relative path after cd
+          rel_path="${svc}/${{ inputs.ENVIRONMENT }}/valuesqabranch.yaml"
+
+          if git diff --quiet; then
+            echo "✅ No changes to commit"
+          else
+            git add "$rel_path"
+            git commit -m "Update image tag for ${svc} to ${{ inputs.ENVIRONMENT }}"
+            git push origin ${{ inputs.HELM_CHARTS_BRANCH_NAME }}
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: IngotTech/argocd-management
+          token: ${{ secrets.INGOT_GITBOT_TOKEN }}
+          ref: develop
+          path: argocd-management
+
+      - name: Debug ArgoCD manifest creation
+        run: |
+          svc="${{ needs.build-solution.outputs.service_name }}"
+          env="${{ inputs.ENVIRONMENT }}"
+          branch="develop"
+
+          repo_dir="argocd-management"
+          app_file="${repo_dir}/argocd-management/trading-platform/${env}/${svc}-${env}.yaml"
+
+          echo "🧩 Creating ArgoCD Application manifest for ${svc} (${env})"
+          echo "📂 Repo dir: $repo_dir"
+          echo "📝 App file will be written to: $app_file"
+
+          mkdir -p "$(dirname "$app_file")"
+
+          cat <<EOF > "$app_file"
+          apiVersion: argoproj.io/v1alpha1
+          kind: Application
+          metadata:
+            name: ${svc}-${env}
+            namespace: argocd
+          spec:
+            project: trading-platform-helm-charts
+            source:
+              repoURL: https://github.com/IngotTech/trading-platform-helm-charts.git
+              targetRevision: ${branch}
+              path: ${svc}
+              helm:
+                valueFiles:
+                  - ${env}/valuesqabranch.yaml
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: trading-platform
+            syncPolicy:
+              automated:
+                prune: true
+                selfHeal: true
+              syncOptions:
+                - CreateNamespace=true
+          EOF
+
+          echo "✅ Manifest file created. Let's inspect paths..."
+          echo "=== PWD before cd ==="
+          pwd
+          echo "=== Tree of argocd-management ==="
+          ls -R argocd-management | head -n 50
+
+          # Move into repo
+          cd "$repo_dir"
+          echo "=== PWD after cd ==="
+          pwd
+          echo "=== Git status ==="
+          git status
+          echo "=== Untracked files ==="
+          git ls-files --others --exclude-standard || true
+          echo "=== Diff (uncommitted changes) ==="
+          git diff --name-only || true
+
+          git config user.email "git-bot@ingotbrokers.com"
+          git config user.name "ingot-gitbot"
+
+          rel_path="argocd-management/trading-platform/${env}/${svc}-${env}.yaml"
+          echo "🔍 Checking relative path inside repo: $rel_path"
+          ls -l "$rel_path" || echo "⚠️ File not found at relative path"
+
+          # ✅ Detects both new and modified files
+          if git ls-files --error-unmatch "$rel_path" >/dev/null 2>&1; then
+            # File is tracked, check for changes
+            if ! git diff --quiet -- "$rel_path"; then
+              echo "🚀 Changes detected (existing file modified), committing..."
+              git add "$rel_path"
+              git commit -m "Update ArgoCD Application for ${svc}-${env}"
+              git push origin ${branch}
+            else
+              echo "✅ No ArgoCD changes to commit (already up to date)"
+            fi
+          else
+            # File is new and untracked
+            echo "🆕 New ArgoCD file detected, committing..."
+            git add "$rel_path"
+            git commit -m "Add ArgoCD Application for ${svc}-${env}"
+            git push origin ${branch}
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::987879449406:role/eks_cluster_rnd-oidc-role
+          aws-region: eu-central-1
+      - run: |
+          aws eks update-kubeconfig \
+            --region eu-central-1 \
+            --name eks_cluster_rnd \
+            --alias eks-rnd
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.33.0
+      - name: Force Replace ArgoCD Application
+        run: |
+          svc="${{ needs.build-solution.outputs.service_name }}"
+          env="${{ inputs.ENVIRONMENT }}"
+
+          echo "⚡ Force replacing ArgoCD Application ${svc}-${env}"
+          kubectl delete -n trading-platform deploy ${svc}-${env}
+          kubectl delete -f "argocd-management/argocd-management/trading-platform/${env}/${svc}-${env}.yaml" --ignore-not-found
+          kubectl apply -f "argocd-management/argocd-management/trading-platform/${env}/${svc}-${env}.yaml"          
